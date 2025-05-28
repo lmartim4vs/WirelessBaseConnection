@@ -1,109 +1,154 @@
 /*
- * SPDX-FileCopyrightText: 2021-2024 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Unlicense OR CC0-1.0
+ * Example showing different ways to use the BLE UART
  */
 
-/****************************************************************************
-*
-* This demo showcases BLE GATT server. It can send adv data, be connected by client.
-* Run the gatt_client demo, the client demo will automatically connect to the gatt_server demo.
-* Client demo will enable gatt_server's notify after connection. The two devices will then exchange
-* data.
-*
-****************************************************************************/
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "ble_uart.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
+#include <string.h>
+#include <stdlib.h>
 
+static const char* TAG = "USAGE_EXAMPLE";
 
-#include "ble_gatts_server.h"
-#include "ble_gap_handler.h" 
-#include "ble_profile_b.h"
-#include "ble_config.h"
-
-static const char* TAG = "BLE_MAIN";
-
-static esp_err_t initialize_nvs(void)
+// 1. Simple data sending
+void example_send_data(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    if (ble_uart_is_connected()) {
+        // Send string
+        char* message = "Hello BLE World!";
+        ble_uart_write((uint8_t*)message, strlen(message));
+        
+        // Send binary data
+        uint8_t sensor_data[] = {0x01, 0x02, 0x03, 0x04, 0xFF};
+        ble_uart_write(sensor_data, sizeof(sensor_data));
+        
+        // Send JSON-like data
+        char json[] = "{\"temp\":25.5,\"humidity\":60}";
+        ble_uart_write((uint8_t*)json, strlen(json));
     }
-    return ret;
 }
 
-static esp_err_t initialize_bluetooth(void)
+// 2. Command processing on RX
+void on_command_received(uint8_t* data, uint16_t len)
 {
-    esp_err_t ret;
-
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        ESP_LOGE(TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
-        return ret;
+    // Convert to string for easier processing
+    char command[len + 1];
+    memcpy(command, data, len);
+    command[len] = '\0';
+    
+    ESP_LOGI(TAG, "Processing command: '%s'", command);
+    
+    // Simple command parser
+    if (strncmp(command, "LED_ON", 6) == 0) {
+        ESP_LOGI(TAG, "💡 Turning LED ON");
+        // gpio_set_level(LED_PIN, 1);
+        ble_uart_write((uint8_t*)"LED ON", 6);
+        
+    } else if (strncmp(command, "LED_OFF", 7) == 0) {
+        ESP_LOGI(TAG, "💡 Turning LED OFF");
+        // gpio_set_level(LED_PIN, 0);
+        ble_uart_write((uint8_t*)"LED OFF", 7);
+        
+    } else if (strncmp(command, "STATUS", 6) == 0) {
+        char status[] = "ESP32 is running OK";
+        ble_uart_write((uint8_t*)status, strlen(status));
+        
+    } else if (strncmp(command, "TEMP", 4) == 0) {
+        char temp_response[] = "Temperature: 25.3°C";
+        ble_uart_write((uint8_t*)temp_response, strlen(temp_response));
+        
+    } else {
+        char error[] = "Unknown command";
+        ble_uart_write((uint8_t*)error, strlen(error));
     }
+}
 
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        ESP_LOGE(TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
-        return ret;
+// 3. Sensor data streaming
+void stream_sensor_data_task(void* arg)
+{
+    while (1) {
+        if (ble_uart_is_connected()) {
+            // Simulate sensor readings
+            float temperature = 25.0 + (rand() % 100) / 10.0f;
+            float humidity = 50.0 + (rand() % 500) / 10.0f;
+            
+            // Send as formatted string
+            char sensor_str[64];
+            snprintf(sensor_str, sizeof(sensor_str), 
+                    "T:%.1f,H:%.1f", temperature, humidity);
+            ble_uart_write((uint8_t*)sensor_str, strlen(sensor_str));
+            
+            // Or send as binary struct
+            typedef struct {
+                float temp;
+                float hum;
+                uint32_t timestamp;
+            } sensor_data_t;
+            
+            sensor_data_t data = {
+                .temp = temperature,
+                .hum = humidity,
+                .timestamp = xTaskGetTickCount()
+            };
+            ble_uart_write((uint8_t*)&data, sizeof(data));
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Every 2 seconds
     }
+}
 
-    ret = esp_bluedroid_init();
-    if (ret) {
-        ESP_LOGE(TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return ret;
+// 4. File/Data transfer simulation
+void send_large_data(void)
+{
+    if (!ble_uart_is_connected()) return;
+    
+    // Simulate sending a large file in chunks
+    const char* large_data = "This is a large piece of data that needs to be sent in multiple packets because BLE has packet size limitations...";
+    
+    size_t total_len = strlen(large_data);
+    size_t sent = 0;
+    size_t chunk_size = 20; // Send in 20-byte chunks
+    
+    while (sent < total_len) {
+        size_t to_send = (total_len - sent > chunk_size) ? chunk_size : (total_len - sent);
+        
+        esp_err_t ret = ble_uart_write((uint8_t*)(large_data + sent), to_send);
+        if (ret == ESP_OK) {
+            sent += to_send;
+            ESP_LOGI(TAG, "Sent chunk %zu/%zu", sent, total_len);
+        } else {
+            ESP_LOGE(TAG, "Failed to send chunk");
+            break;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100)); // Small delay between chunks
+    }
+}
+
+// 5. Complete initialization example
+void complete_setup_example(void)
+{
+    // Initialize
+    esp_err_t ret = ble_uart_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BLE UART init failed");
+        return;
     }
     
-    ret = esp_bluedroid_enable();
-    if (ret) {
-        ESP_LOGE(TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return ret;
-    }
-
-    return ESP_OK;
+    // Set RX callback
+    ble_uart_set_rx_callback(on_command_received);
+    
+    // Start service
+    ble_uart_start();
+    
+    // Create tasks
+    xTaskCreate(stream_sensor_data_task, "sensor_task", 4096, NULL, 5, NULL);
+    
+    ESP_LOGI(TAG, "BLE UART setup complete!");
 }
 
 void app_main(void)
 {
-    esp_err_t ret;
-
-    // Initialize NVS
-    ESP_ERROR_CHECK(initialize_nvs());
-
-    #if CONFIG_EXAMPLE_CI_PIPELINE_ID
-    ble_gap_set_device_name_from_example();
-    #endif
-
-    // Initialize Bluetooth
-    ESP_ERROR_CHECK(initialize_bluetooth());
-
-    // Initialize Profile B callback
-    ble_profile_b_init();
-
-    // Initialize BLE GATT Server
-    ESP_ERROR_CHECK(ble_gatts_server_init());
-
-    // Initialize BLE GAP
-    ESP_ERROR_CHECK(ble_gap_init());
-
-    // Set local MTU
-    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
-    if (local_mtu_ret) {
-        ESP_LOGE(TAG, "set local MTU failed, error code = %x", local_mtu_ret);
-    }
-
-    ESP_LOGI(TAG, "BLE GATTS Server initialized successfully");
+   complete_setup_example();
 }
